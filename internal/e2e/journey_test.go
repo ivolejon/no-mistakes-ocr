@@ -2709,11 +2709,14 @@ func assertPipelineStepsInOrder(t *testing.T, steps []ipc.StepResultInfo) {
 		t.Fatalf("pipeline recorded %d steps, want %d", len(steps), len(expected))
 	}
 	for i, step := range steps {
-		if step.StepOrder != i+1 {
-			t.Errorf("step %d order = %d, want %d", i, step.StepOrder, i+1)
-		}
 		if step.StepName != expected[i] {
 			t.Errorf("step %d name = %s, want %s", i, step.StepName, expected[i])
+		}
+		// Order is the step name's fixed execution position (types.StepName),
+		// not a contiguous index: the opt-in OpenCodeReview gate occupies
+		// position 4, so the default core sequence carries a gap there.
+		if want := types.StepName(step.StepName).Order(); step.StepOrder != want {
+			t.Errorf("step %s order = %d, want %d", step.StepName, step.StepOrder, want)
 		}
 	}
 }

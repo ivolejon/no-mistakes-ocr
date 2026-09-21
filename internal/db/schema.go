@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS runs (
     push_active             INTEGER NOT NULL DEFAULT 0,
     terminal_head_verified_at INTEGER,
     gates_json              TEXT,
+    ocr_enabled             INTEGER NOT NULL DEFAULT 0,
     error                   TEXT,
     awaiting_agent_since INTEGER,
     parked_ms            INTEGER,
@@ -304,6 +305,14 @@ var migrationStatements = []string{
 	// empty both mean the bare core pipeline, which is the only sequence a row
 	// written before this column existed can have had.
 	`ALTER TABLE runs ADD COLUMN gates_json TEXT`,
+	// Whether the OpenCodeReview gate was part of this run's step sequence.
+	// Durable for the same reason gates_json is: the trusted default branch may
+	// flip ocr.enabled while a run is parked, and recovery re-deriving the
+	// sequence from the current config would match the run's recorded steps
+	// against a sequence it never executed. NULL and 0 both mean the gate was
+	// off, which is the only sequence a row written before the column existed
+	// can have had.
+	`ALTER TABLE runs ADD COLUMN ocr_enabled INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE step_results ADD COLUMN auto_fix_limit INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN ci_fix_attempts INTEGER NOT NULL DEFAULT 0`,
 	// Non-nil exactly when a human answered ActionApprove on a step whose gate

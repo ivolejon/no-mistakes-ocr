@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `rebase.strategy`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, and `pr.publish_intent` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `ocr` (the whole OpenCodeReview gate block), `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `rebase.strategy`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, and `pr.publish_intent` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -50,6 +50,20 @@ review:
       instructions: |
         Prose changes only. Do not request test coverage.
 
+# Optional OpenCodeReview gate (github.com/alibaba/open-code-review).
+# The whole block is read only from the trusted default branch: it decides
+# whether an extra review gate runs on a branch and with which LLM identity
+# and budget. Off by default.
+# ocr:
+#   enabled: true
+#   effort: medium            # low | medium | high
+#   provider: anthropic       # optional ocr provider override
+#   model: claude-opus-4-6    # optional ocr model override
+#   timeout_minutes: 15       # per-subtask deadline, 0 = no deadline
+#   min_severity: low         # critical | high | medium | low
+#   delegate: false           # true = review via the pipeline's own agent (no OCR-side LLM needed)
+#   background: true          # pass the run's user intent to ocr
+
 # For orchestration repos whose project instructions would misidentify gate agents.
 # Read only from the trusted default branch. Defaults to false.
 disable_project_settings: true
@@ -69,6 +83,7 @@ auto_fix:
   rebase: 3
   review: 3
   test: 3
+  ocr: 3
   document: 3
   lint: 5
   ci: 3
@@ -444,6 +459,36 @@ These checks run on whichever copy of the file is parsed, including the pushed b
 
 Like `document.instructions`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): a value present only on a pushed branch is ignored, so a contributor cannot inject instructions into the review that gates them.
 
+### ocr
+
+The OpenCodeReview gate: a whole-block opt-in that runs the external [`ocr` CLI](https://github.com/alibaba/open-code-review) over the same diff the Review step examined, immediately after Review, and surfaces its line-level comments as findings (see [Pipeline Steps: OpenCodeReview (OCR)](/no-mistakes/reference/pipeline-steps/#opencodereview-ocr)). Off by default; the step is a member of a run's step sequence only when enabled.
+
+| | |
+|---|---|
+| Type | `object` |
+| Default | Disabled |
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `ocr.enabled` | `boolean` | `false` | Runs the OpenCodeReview gate after Review. Pinned per run at creation so recovery rebuilds the exact sequence that ran. |
+| `ocr.effort` | `string` | `medium` | The `ocr review --effort` preset: `low`, `medium`, or `high`. Higher effort adds review rounds and improves recall at proportionally higher LLM cost. |
+| `ocr.provider` | `string` | unset | Overrides the resolved `ocr` provider for this run's invocations. |
+| `ocr.model` | `string` | unset | Overrides the resolved `ocr` model for this run's invocations. |
+| `ocr.timeout_minutes` | `int` | `15` | The per-subtask deadline passed as `ocr review --timeout`. `0` disables the per-subtask deadline. |
+| `ocr.min_severity` | `string` | `low` | Lowest OCR severity (`critical`, `high`, `medium`, `low`) that becomes a pipeline finding at all. Comments below it are dropped. |
+| `ocr.delegate` | `boolean` | `false` | Delegation mode: instead of `ocr review` (which needs an LLM endpoint configured on the OCR side), the step runs `ocr delegate preview`/`ocr delegate rule` for deterministic file selection and rule resolution, then hands the scaffold to the pipeline's own review agent (the configured [`agent`](/no-mistakes/reference/global-config/#agent), e.g. `opencode`) for the LLM work. No OCR-side LLM configuration is needed. |
+| `ocr.background` | `boolean` | `true` | Passes the run's user intent as `ocr review --background` so the review is judged against the change's stated purpose. |
+
+Severity mapping to pipeline findings: `critical`/`high` → `error` (blocking), `medium` → `warning` (blocking), `low` → `info` (listed on the PR only). Error and warning findings carry `auto-fix`, so the shared fixer agent repairs them within the [`auto_fix.ocr`](#auto_fix) budget before the step re-runs OCR over the repaired head. The gate passes when a fresh OCR run reports no error- or warning-severity comments; OCR's `skipped` envelope (nothing eligible to review) is an honest empty pass, and any other unreadable or failing run fails the step closed.
+
+With `ocr.delegate: true`, the LLM work moves to the pipeline's own review agent: the step runs `ocr delegate preview --format json` (file selection + ref metadata, honoring `ignore_patterns` via `--exclude`) and `ocr delegate rule --format json` (resolved rule groups), then asks the configured agent to review exactly those files under the review step's output contract - findings, `reviewed_paths` coverage, risk assessment. Delegation mode needs no OCR-side LLM configuration (`ocr config …`/`OCR_LLM_*`), so a machine whose only LLM budget is the pipeline agent's subscription can still run the gate; `ocr.effort`, `ocr.provider`, and `ocr.model` apply to `ocr review` only and are ignored under delegation.
+
+OCR uses its own LLM configuration (`ocr config …` or `OCR_LLM_*` environment variables) - never the pipeline's agent selection - and must be installed on the daemon host (`npm install -g @alibaba-group/open-code-review`). In delegation mode the pipeline's agent supplies the LLM instead, so no OCR-side configuration is needed, but `ocr` must still be installed for the scaffold commands.
+
+#### Trust
+
+The whole block is **gate-control** and therefore honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): it decides whether an extra review gate runs on a branch and with which LLM identity and budget, so a contributor must not be able to switch their own branch out of it or change what it runs. An invalid value (`ocr.effort: ultra`, an unknown `ocr.min_severity`, a negative `ocr.timeout_minutes`) fails the run that carries it, even on a pushed branch, so a broken block surfaces before it merges and becomes the trusted copy.
+
 ### gates
 
 Extra repository-declared checks that run inside the pipeline, in addition to the core steps.
@@ -466,7 +511,7 @@ A gate runs its command in the run worktree through the platform shell, `sh -c` 
 
 #### Placement
 
-`after` names the core step the gate runs immediately after. Valid anchors are `rebase`, `review`, `test`, `document`, and `lint`.
+`after` names the core step the gate runs immediately after. Valid anchors are `rebase`, `review`, `test`, `document`, and `lint`. `ocr` is not an anchor: the OpenCodeReview gate is opt-in, so a gate anchored after it would silently vanish on runs where the step is off.
 
 The delivery tail (`push`, `pr`, `ci`) cannot be anchored: a gate that ran after push would be validating a branch the world can already see. `intent` cannot be anchored either, because it establishes the acceptance criteria the later gates check against.
 
@@ -569,6 +614,7 @@ Override auto-fix attempt limits for specific steps. Fields not set here inherit
 | `auto_fix.rebase` | `int` | Inherits from global (default `3`) |
 | `auto_fix.review` | `int` | Inherits from global (default `0`) |
 | `auto_fix.test` | `int` | Inherits from global (default `3`) |
+| `auto_fix.ocr` | `int` | Inherits from global (default `3`) |
 | `auto_fix.document` | `int` | Inherits from global (default `3`) |
 | `auto_fix.lint` | `int` | Inherits from global (default `3`) |
 | `auto_fix.ci` | `int` | Inherits from global (default `3`) |
