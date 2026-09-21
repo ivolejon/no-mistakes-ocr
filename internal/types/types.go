@@ -49,9 +49,16 @@ func (s RunStatus) Terminal() bool {
 type StepName string
 
 const (
-	StepIntent   StepName = "intent"
-	StepRebase   StepName = "rebase"
-	StepReview   StepName = "review"
+	StepIntent StepName = "intent"
+	StepRebase StepName = "rebase"
+	StepReview StepName = "review"
+	// StepOCR is the OpenCodeReview gate: it runs the external `ocr` CLI
+	// (github.com/alibaba/open-code-review) over the same diff the review step
+	// examined and surfaces its line-level comments as findings. It is present
+	// in a run's step sequence only when the trusted ocr.enabled config opts it
+	// in, and a gate anchored after it would be silently dropped when it is
+	// off, so it is deliberately NOT a custom-gate anchor.
+	StepOCR      StepName = "ocr"
 	StepTest     StepName = "test"
 	StepDocument StepName = "document"
 	StepLint     StepName = "lint"
@@ -110,18 +117,20 @@ func (s StepName) Order() int {
 		return 2
 	case StepReview:
 		return 3
-	case StepTest:
+	case StepOCR:
 		return 4
-	case StepDocument:
+	case StepTest:
 		return 5
-	case StepLint:
+	case StepDocument:
 		return 6
-	case StepPush:
+	case StepLint:
 		return 7
-	case StepPR:
+	case StepPush:
 		return 8
-	case StepCI:
+	case StepPR:
 		return 9
+	case StepCI:
+		return 10
 	default:
 		return 0
 	}
@@ -129,7 +138,7 @@ func (s StepName) Order() int {
 
 // AllSteps returns all core pipeline steps in execution order.
 func AllSteps() []StepName {
-	return []StepName{StepIntent, StepRebase, StepReview, StepTest, StepDocument, StepLint, StepPush, StepPR, StepCI}
+	return []StepName{StepIntent, StepRebase, StepReview, StepOCR, StepTest, StepDocument, StepLint, StepPush, StepPR, StepCI}
 }
 
 func (s StepName) IsCustomGateAnchor() bool {

@@ -11,6 +11,13 @@ user-invocable: true
 the configured push target. You drive it through the `no-mistakes axi` command family, which prints
 machine-readable [TOON](https://toonformat.dev) to stdout and progress to stderr.
 
+When a repository opts in via `ocr.enabled` in its trusted config, an extra `ocr` step runs
+OpenCodeReview (the external `ocr` CLI) right after review and reports its line-level
+comments as findings; error/warning findings are auto-fixed within `auto_fix.ocr` rounds, and
+any remaining ones park for your decision like Review findings do. With `ocr.delegate: true` the
+LLM work moves to the pipeline's own review agent (your configured agent, e.g. opencode), so no
+separate OCR-side LLM configuration is needed - `ocr` only selects and rules the files.
+
 
 ## Active validation-step boundary
 

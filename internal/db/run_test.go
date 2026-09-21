@@ -1403,3 +1403,59 @@ func TestGetRunGatesForUnknownRun(t *testing.T) {
 		t.Errorf("gates for unknown run = %q, want empty", pinned)
 	}
 }
+
+// TestRunOCREnabledIsPinnedAndDefaultsOff covers the durable half of the ocr
+// gate pin: an untouched run reports the gate off (the bare core pipeline,
+// which is the only sequence a row written before this column existed can have
+// had), and a recorded pin survives a reopen of the database.
+func TestRunOCREnabledIsPinnedAndDefaultsOff(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ocr.sqlite")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	enabled, err := d.GetRunOCREnabled(run.ID)
+	if err != nil {
+		t.Fatalf("get run ocr enabled: %v", err)
+	}
+	if enabled {
+		t.Error("ocr_enabled on a fresh run = true, want no pin (false)")
+	}
+
+	if err := d.SetRunOCREnabled(run.ID, true); err != nil {
+		t.Fatalf("set run ocr enabled: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	enabled, err = reopened.GetRunOCREnabled(run.ID)
+	if err != nil {
+		t.Fatalf("get run ocr enabled after restart: %v", err)
+	}
+	if !enabled {
+		t.Error("ocr_enabled after restart = false, want the recorded pin")
+	}
+}
+
+func TestGetRunOCREnabledForUnknownRun(t *testing.T) {
+	d := openTestDB(t)
+	enabled, err := d.GetRunOCREnabled("no-such-run")
+	if err != nil {
+		t.Fatalf("get run ocr enabled: %v", err)
+	}
+	if enabled {
+		t.Fatal("unknown run must report the ocr gate off")
+	}
+}

@@ -9,6 +9,11 @@ This is the per-step reference. For the overview and rationale, see [Pipeline](/
 intent → rebase → review → test → document → lint → push → pr → ci
 ```
 
+```text
+with ocr.enabled: true (trusted):
+intent → rebase → review → ocr → test → document → lint → push → pr → ci
+```
+
 Each step can produce findings, request approval, trigger auto-fix, or apply safe fixes during its own pass. Steps that encounter fatal errors stop the pipeline. Steps can also be pre-skipped when starting a run, skipped by the user, or skipped automatically by the pipeline.
 Pipeline steps do not treat missing, malformed, or semantically incomplete structured analyzer output as a clean result. Such output never creates a gate that unattended AXI mode can accept.
 The Test evidence analyzer first returns the validation errors to the agent for a bounded correction, and Review runs a fresh review up to three times in total when no-mistakes rejects the reviewer's final output; exhausting either bound, and every other step's invalid analyzer output, still stops the affected step.
@@ -143,6 +148,18 @@ Follow-up review passes use the history to avoid re-reporting user-ignored findi
 ### Pipeline HEAD continuity
 
 At entry to every repository gate and every core step from Test through CI, no-mistakes compares the live worktree `HEAD` with the pipeline-recorded head. An equal head or a pipeline-descendant commit continues. A backward reset, divergent sibling, or unverifiable relationship fails the run before that step performs work, including for steps that would not create a commit.
+
+## OpenCodeReview (OCR)
+
+When the repository opts in via the trusted [`ocr.enabled`](/no-mistakes/reference/repo-config/#ocr) flag, the OpenCodeReview gate runs immediately after Review over the same diff Review examined, through the external `ocr` CLI ([github.com/alibaba/open-code-review](https://github.com/alibaba/open-code-review)). `ocr` resolves the base..head range it is given, runs its deterministic filter pipeline plus LLM sub-agents per file group, and returns line-level comments. The step converts those comments into findings and parks, or - within the `auto_fix.ocr` budget - auto-fixes them, exactly like Review does.
+
+- **Severity mapping**: OCR `critical`/`high` comments become `error` findings, `medium` becomes `warning`, and `low` becomes `info`. Error- and warning-severity findings block the run; info findings are listed on the PR snapshot only and never park.
+- **Action mapping**: error and warning findings carry `auto-fix`, so the shared fixer agent addresses them and the step re-runs OCR over the repaired head; anything a fix round cannot resolve parks after the budget is exhausted. Info findings are `no-op`.
+- **Gate verdict**: the gate passes when a fresh `ocr review` over the current head reports no error- or warning-severity comments. OCR's `skipped` envelope (no eligible files changed) is an honest empty pass, matching Review's no-change verdict. A nonzero exit, an unreadable payload, or an unexpected `status` fails the step closed - an unrun or unreadable analyzer never reads as an approving pass.
+- **Configuration**: `ocr.effort`, `ocr.provider`, `ocr.model`, `ocr.timeout_minutes`, and `ocr.min_severity` shape the underlying `ocr review` invocation; `ocr.background: true` (default) passes the run's user intent as review background. The whole block is honored only from the trusted default-branch copy so a pushed branch cannot switch itself out of the gate or change what it runs.
+- **Delegation mode** (`ocr.delegate: true`): the step runs `ocr delegate preview --format json` over the same base..head range - honoring `ignore_patterns` via `--exclude` - and `ocr delegate rule --format json` over the reviewable paths, then hands that deterministic scaffold (refs, file list with diff stats, excluded files and reasons, resolved rule groups) to the pipeline's own review agent (the configured `agent`, e.g. `opencode`) under the review step's output contract: findings, `reviewed_paths` coverage, risk assessment. No OCR-side LLM configuration is needed - the agent's existing subscription powers the review. A clean verdict still requires every OCR-selected file to appear in `reviewed_paths`, exactly like the review step's coverage rule. `ocr.effort`/`provider`/`model` apply to `ocr review` only and are ignored under delegation.
+- **Opt-in and pinned**: the gate appears in a run's step sequence only when the trusted config enabled it, and its presence is pinned to each run (like `gates`), so crash recovery rebuilds the exact sequence that ran even if the default branch toggles the flag meanwhile. `ocr` is a step name but deliberately not a `gates:` anchor: a gate anchored after it would silently vanish when the step is off.
+- **Environment**: OCR uses its own LLM configuration (`ocr config …` or the `OCR_LLM_*` environment variables), never the pipeline's agent selection, and must be installed on the daemon host (`npm install -g @alibaba-group/open-code-review`). A missing binary fails the step with an install hint rather than an opaque shell error. In delegation mode the pipeline's agent supplies the LLM instead and no OCR-side configuration is needed, but `ocr` must still be installed for the scaffold commands.
 
 ## Test
 
@@ -292,7 +309,7 @@ The `v1` payload is compact JSON with these required fields:
 - `head_sha`: the exact git commit SHA recorded for the run when no-mistakes writes the PR body
 - `steps`: the ordered pipeline step snapshot; every item has the required fields below and may carry the optional Test override field described afterward
 
-- `step`: the raw pipeline step name, such as `intent`, `rebase`, `review`, `test`, `document`, `lint`, `push`, `pr`, or `ci`; a repository-declared [gate](/no-mistakes/reference/repo-config/#gates) appears as `gate.<anchor>.<name>`
+- `step`: the raw pipeline step name, such as `intent`, `rebase`, `review`, `ocr`, `test`, `document`, `lint`, `push`, `pr`, or `ci`; a repository-declared [gate](/no-mistakes/reference/repo-config/#gates) appears as `gate.<anchor>.<name>`
 - `status`: the raw [step status](#step-statuses) recorded for that step, such as `completed`, `skipped`, or `failed`
 
 When the Test step validated the same `head_sha`, the payload also includes `live_validation` with `verdict`, `live` (the number of scenarios driven live), and `total`. The field is omitted for pre-contract findings and whenever a later Document, Lint, Push, or repair commit changes the head without validating that new commit. Consumers therefore never receive a previous head's live-validation verdict as a claim about the current head.

@@ -356,6 +356,27 @@ func WithCustomGates(core []pipeline.Step, gates []config.Gate) []pipeline.Step 
 	return sequence
 }
 
+// WithConfiguredSteps returns the run's step sequence: WithCustomGates, plus
+// the OpenCodeReview gate inserted immediately after the review step when the
+// run's trusted config opted it in. The daemon pins ocr.enabled to the run at
+// creation (db.SetRunOCREnabled) and reads that pin back during recovery, so
+// recovery rebuilds exactly the sequence the run executed even if the trusted
+// default branch toggled the flag meanwhile.
+func WithConfiguredSteps(core []pipeline.Step, gates []config.Gate, ocrEnabled bool) []pipeline.Step {
+	sequence := WithCustomGates(core, gates)
+	if !ocrEnabled || IsDemoMode() {
+		return sequence
+	}
+	out := make([]pipeline.Step, 0, len(sequence)+1)
+	for _, step := range sequence {
+		out = append(out, step)
+		if step.Name() == types.StepReview {
+			out = append(out, &OCRStep{})
+		}
+	}
+	return out
+}
+
 // AllSteps returns the fixed core pipeline step sequence.
 // When NM_DEMO=1, it returns mock steps for demo recordings.
 func AllSteps() []pipeline.Step {

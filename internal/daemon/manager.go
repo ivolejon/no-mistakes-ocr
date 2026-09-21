@@ -166,7 +166,7 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if err != nil {
 		return nil, err
 	}
-	execSteps := steps.WithCustomGates(m.steps(), cfg.Gates)
+	execSteps := steps.WithConfiguredSteps(m.steps(), cfg.Gates, cfg.OCR.Enabled)
 	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
 		return nil, err
 	}
@@ -256,6 +256,16 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 		return nil, err
 	}
 	cfg.Gates = gates
+	// The OpenCodeReview gate's presence is pinned to the run for the same
+	// reason the gates are: recovery rebuilds the exact step sequence the run
+	// executed, and the trusted default branch may have toggled ocr.enabled
+	// since this run parked. Everything else in the ocr block (effort,
+	// provider, model, thresholds) is deliberately re-read live.
+	ocrEnabled, err := m.db.GetRunOCREnabled(run.ID)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OCR.Enabled = ocrEnabled
 	if err := cfg.ApplyPiProfile(run.PiProfile); err != nil {
 		return nil, err
 	}
@@ -1547,8 +1557,16 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("record_gates")
 		return "", fmt.Errorf("record gates: %w", err)
 	}
+	// The OpenCodeReview gate's presence is pinned like the gates: recovery
+	// rebuilds the exact step sequence the run executed, and the trusted
+	// default branch may toggle ocr.enabled while the run is in flight.
+	if err := m.db.SetRunOCREnabled(run.ID, cfg.OCR.Enabled); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record ocr gate: %s", err))
+		trackStartFailure("record_ocr_gate")
+		return "", fmt.Errorf("record ocr gate: %w", err)
+	}
 
-	execSteps := steps.WithCustomGates(m.steps(), cfg.Gates)
+	execSteps := steps.WithConfiguredSteps(m.steps(), cfg.Gates, cfg.OCR.Enabled)
 	telemetry.Track("run", telemetry.Fields{
 		"action":      "started",
 		"trigger":     trigger,

@@ -310,6 +310,12 @@ type RepoConfig struct {
 	// pushed branch must not be able to inject or weaken the guidance that
 	// reviews it.
 	Review ReviewRaw `yaml:"review"`
+	// OCR carries the OpenCodeReview gate settings. The whole block is
+	// gate-control: it decides whether the extra review gate runs on a branch
+	// and with which LLM identity and budget, so it is honored ONLY from the
+	// trusted default-branch copy (see EffectiveRepoConfig), regardless of
+	// allow_repo_commands.
+	OCR OCRRaw `yaml:"ocr"`
 	// Gates are repository-declared extra checks that run immediately after
 	// their anchor core step. They are additive only: a gate cannot skip,
 	// reorder, or replace a core step, and a failing gate parks for an operator
@@ -361,6 +367,56 @@ type ReviewRaw struct {
 	// at least one changed file; a run that touches nothing matching leaves
 	// the review prompt exactly as it is without this setting.
 	PathInstructions []PathInstruction `yaml:"path_instructions"`
+}
+
+// OCRRaw is the YAML representation of OpenCodeReview step settings.
+//
+// The whole block is gate-control and honored ONLY from the trusted
+// default-branch copy (see EffectiveRepoConfig): it decides whether an extra
+// review gate runs at all and which LLM identity and budget it spends on the
+// pushed branch, so a contributor must not be able to switch their own branch
+// out of it.
+type OCRRaw struct {
+	// Enabled opts the OpenCodeReview gate into the run's step sequence.
+	// Pointer so an explicit `enabled: false` is distinguishable from unset.
+	Enabled *bool `yaml:"enabled"`
+	// Effort is the ocr --effort preset (low/medium/high). Empty means the
+	// default (medium).
+	Effort string `yaml:"effort"`
+	// Provider overrides the resolved ocr provider for this run's invocations.
+	Provider string `yaml:"provider"`
+	// Model overrides the resolved ocr model for this run's invocations.
+	Model string `yaml:"model"`
+	// TimeoutMin is the per-subtask deadline passed as ocr --timeout. 0 means
+	// no per-subtask deadline.
+	TimeoutMin int `yaml:"timeout_minutes"`
+	// MinSeverity is the lowest ocr severity (critical/high/medium/low) that
+	// becomes a pipeline finding at all. Empty means the default (low: every
+	// comment becomes a finding, severity-mapped).
+	MinSeverity string `yaml:"min_severity"`
+	// Delegate switches the step to OCR's delegation mode: instead of `ocr
+	// review` (which needs an LLM endpoint configured on the OCR side), the
+	// step runs `ocr delegate preview`/`ocr delegate rule` for deterministic
+	// file selection and rule resolution, then hands the scaffold to the
+	// pipeline's own review agent (the configured `agent`, e.g. opencode) for
+	// the LLM work. No OCR-side LLM configuration is needed.
+	Delegate bool `yaml:"delegate"`
+	// Background sends the run's user intent as ocr --background so the
+	// review plan is judged against the change's stated purpose. Pointer so an
+	// explicit `background: false` is expressible. Default true.
+	Background *bool `yaml:"background"`
+}
+
+// OCR holds the resolved OpenCodeReview step settings.
+type OCR struct {
+	Enabled     bool
+	Effort      string
+	Provider    string
+	Model       string
+	TimeoutMin  int
+	MinSeverity string
+	Delegate    bool
+	Background  bool
 }
 
 // PRRaw is the YAML representation of pull-request settings.
@@ -503,6 +559,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		PR                     PRRaw        `yaml:"pr"`
 		Document               DocumentRaw  `yaml:"document"`
 		Review                 ReviewRaw    `yaml:"review"`
+		OCR                    OCRRaw       `yaml:"ocr"`
 		Gates                  []Gate       `yaml:"gates"`
 		DisableProjectSettings bool         `yaml:"disable_project_settings"`
 		NoCI                   bool         `yaml:"no_ci"`
@@ -527,6 +584,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.PR = raw.PR
 	c.Document = raw.Document
 	c.Review = raw.Review
+	c.OCR = raw.OCR
 	c.Gates = raw.Gates
 	c.DisableProjectSettings = raw.DisableProjectSettings
 	c.NoCI = raw.NoCI
@@ -548,6 +606,7 @@ type AutoFixRaw struct {
 	Lint     *int `yaml:"lint"`
 	Test     *int `yaml:"test"`
 	Review   *int `yaml:"review"`
+	OCR      *int `yaml:"ocr"`
 	Document *int `yaml:"document"`
 	CI       *int `yaml:"ci"`
 	Babysit  *int `yaml:"babysit"`
@@ -639,6 +698,7 @@ type AutoFix struct {
 	Lint     int
 	Test     int
 	Review   int
+	OCR      int
 	Document int
 	CI       int
 	Rebase   int
@@ -687,6 +747,7 @@ type Config struct {
 	Test           Test
 	Document       Document
 	Review         Review
+	OCR            OCR
 	PR             PR
 	ForgeProfiles  ForgeProfiles
 	// DisableProjectSettings is the resolved, trusted-only opt-out (see the
@@ -2392,6 +2453,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := validateRebaseRaw(cfg.Rebase); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	if err := validateOCRRaw(cfg.OCR); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
 	cfg.PR.BaseBranch = strings.TrimSpace(cfg.PR.BaseBranch)
 	if err := validatePRRaw(cfg.PR); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
@@ -2540,6 +2604,13 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// must not silently drop the maintainer's review rules when the pushed
 		// branch happens to carry no review block.
 		effective.Review = trusted.Review
+		// The whole ocr block is trusted-only: it decides whether the
+		// OpenCodeReview gate runs on the pushed branch at all, which LLM
+		// identity it spends, and how deep it reviews. A contributor must not
+		// be able to switch their own branch out of the maintainer's chosen
+		// review depth or budget, so the block is honored only from the
+		// trusted default-branch copy, regardless of allow_repo_commands.
+		effective.OCR = trusted.OCR
 		// gates define what validating the pushed branch means - they execute
 		// shell on the daemon host - so they are
 		// trusted-only for exactly the reason review.path_instructions is, and
@@ -2609,6 +2680,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.Document = DocumentRaw{}
 		effective.ProtectedPaths = nil
 		effective.Review = ReviewRaw{}
+		effective.OCR = OCRRaw{}
 		effective.Gates = nil
 		effective.DisableProjectSettings = false
 		effective.NoCI = false
@@ -2876,6 +2948,7 @@ func autoFixDefaults() AutoFix {
 		Lint:     3,
 		Test:     3,
 		Review:   0,
+		OCR:      3,
 		Document: 3,
 		CI:       3,
 		Rebase:   3,
@@ -2902,6 +2975,48 @@ func rebaseDefaults() Rebase {
 	return Rebase{Strategy: DefaultRebaseStrategy}
 }
 
+// ocrDefaults returns the default OpenCodeReview step settings. The gate is
+// off until a repository enables it; when enabled it reviews at medium effort,
+// turns every comment (down to low) into a severity-mapped finding, and passes
+// the run's user intent as review background.
+func ocrDefaults() OCR {
+	return OCR{
+		Enabled:     false,
+		Effort:      "medium",
+		TimeoutMin:  15,
+		MinSeverity: "low",
+		Background:  true,
+	}
+}
+
+// applyOCROverrides applies non-nil raw values onto resolved defaults.
+func applyOCROverrides(dst *OCR, src *OCRRaw) {
+	if src.Enabled != nil {
+		dst.Enabled = *src.Enabled
+	}
+	if v := strings.TrimSpace(src.Effort); v != "" {
+		dst.Effort = v
+	}
+	if v := strings.TrimSpace(src.Provider); v != "" {
+		dst.Provider = v
+	}
+	if v := strings.TrimSpace(src.Model); v != "" {
+		dst.Model = v
+	}
+	if src.TimeoutMin != 0 {
+		dst.TimeoutMin = src.TimeoutMin
+	}
+	if v := strings.TrimSpace(src.MinSeverity); v != "" {
+		dst.MinSeverity = v
+	}
+	if src.Delegate {
+		dst.Delegate = true
+	}
+	if src.Background != nil {
+		dst.Background = *src.Background
+	}
+}
+
 // applyRebaseOverrides applies a raw strategy onto resolved defaults.
 // The value was already validated at parse time, so an unrecognized one cannot
 // reach here; an empty string is treated as "not set" so a repository can
@@ -2921,6 +3036,27 @@ func validateRebaseRaw(r RebaseRaw) error {
 		return nil
 	}
 	return fmt.Errorf("rebase.strategy: %q is not a valid strategy (want %q or %q)", r.Strategy, RebaseStrategyRebase, RebaseStrategyMerge)
+}
+
+// validateOCRRaw fails the config closed on an ocr block the OpenCodeReview
+// step could not honor deterministically: an unknown effort preset, an unknown
+// severity level, or a negative per-subtask timeout. An empty value is valid
+// and means the default.
+func validateOCRRaw(raw OCRRaw) error {
+	switch strings.TrimSpace(raw.Effort) {
+	case "", "low", "medium", "high":
+	default:
+		return fmt.Errorf("ocr.effort: %q is not a valid effort preset (want low, medium, or high)", raw.Effort)
+	}
+	switch strings.TrimSpace(raw.MinSeverity) {
+	case "", "critical", "high", "medium", "low":
+	default:
+		return fmt.Errorf("ocr.min_severity: %q is not a valid severity (want critical, high, medium, or low)", raw.MinSeverity)
+	}
+	if raw.TimeoutMin < 0 {
+		return fmt.Errorf("ocr.timeout_minutes must not be negative")
+	}
+	return nil
 }
 
 // applyCIOverrides applies non-nil raw values onto resolved defaults, clamping
@@ -2951,6 +3087,9 @@ func applyAutoFixOverrides(dst *AutoFix, src *AutoFixRaw) {
 	if src.Review != nil {
 		dst.Review = *src.Review
 	}
+	if src.OCR != nil {
+		dst.OCR = *src.OCR
+	}
 	if src.Document != nil {
 		dst.Document = *src.Document
 	}
@@ -2972,6 +3111,8 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 		return c.AutoFix.Test
 	case types.StepReview:
 		return c.AutoFix.Review
+	case types.StepOCR:
+		return c.AutoFix.OCR
 	case types.StepDocument:
 		return c.AutoFix.Document
 	case types.StepCI:
@@ -3055,6 +3196,14 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		pr.TitleFormat = *repo.PR.TitleFormat
 	}
 
+	// The OCR block is repository-only in the same sense test.instructions is:
+	// it names the external review gate that validates a repository's branches
+	// and the LLM identity behind it, so there is no machine-wide default a
+	// global file should set on behalf of every repository. repo is the
+	// EffectiveRepoConfig result, so these values are already trusted-only.
+	ocr := ocrDefaults()
+	applyOCROverrides(&ocr, &repo.OCR)
+
 	cfg := &Config{
 		Agent:                 global.Agent,
 		Agents:                copyAgents(global.Agents),
@@ -3091,6 +3240,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
 		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
+		OCR:            ocr,
 		PR:             pr,
 		ForgeProfiles:  global.ForgeProfiles,
 		Providers:      providers,
