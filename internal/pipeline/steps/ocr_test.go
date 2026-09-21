@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -405,6 +406,12 @@ func TestWithConfiguredSteps_InsertsOCROnlyWhenEnabled(t *testing.T) {
 // runner. This is the one test that would catch a wiring bug between the step
 // and runStepShellCommand (wrong env, wrong cwd, lost output).
 func TestOCRStep_ExecutesRealOcrBinaryFromPATH(t *testing.T) {
+	// The fake `ocr` binary is a #!/bin/sh script, which is not executable on
+	// Windows; the production shell path it exercises is covered by the
+	// injected-runner tests on every platform.
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ocr binary is a #!/bin/sh script, not executable on Windows")
+	}
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", headSHA)
 
